@@ -1,0 +1,9 @@
+#!/bin/sh
+# Inside a nest-veil workspace this directory is first on PATH, so plain
+# `code`, `brave`, `firefox`, ... open that workspace's own instance. The other
+# shims are symlinks to this file; the name they're called by picks the command.
+name=$(basename "$0")
+[ -n "$NEST_VEIL" ] && exec nest-veil "$NEST_VEIL" "$name" "$@"
+# No workspace active: run the real command.
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$(dirname "$0")" | paste -sd:)
+exec "$name" "$@"

@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# nest-veil: run commands in a workspace, a separate set of logins and configs
+# (e.g. one per client), next to your normal private setup.
+#
+#   nest-veil                       show the active workspace and list all
+#   nest-veil new <name>            create a workspace
+#   nest-veil set <name> <dir>      auto-enable <name> in <dir> and below
+#   nest-veil unset <dir>           stop auto-enabling a workspace in <dir>
+#   nest-veil <name> <cmd> [args]   run <cmd> in workspace <name>
+#   nest-veil <name>                start a shell ($SHELL) in workspace <name>
+#   nest-veil off [cmd] [args]      run <cmd> (or a shell) outside any workspace
+#   nest-veil --version             print the version
+#
+# Nesting follows the directories: if a workspace's directory is inside
+# another workspace's directory, it's nested in that one. A nested workspace
+# uses its parent's logins (claude/, gh/, vscode/, browsers/<browser>) unless
+# it has its own; create the folder to split one off. Its env and gitconfig
+# are applied on top of the parent's.
+#
+# Each workspace is a folder in $NEST_VEIL_HOME (default
+# ~/.config/nest-veil/<name>):
+#   claude/      Claude Code config + login        (CLAUDE_CONFIG_DIR)
+#   gh/          GitHub CLI config + login         (GH_CONFIG_DIR)
+#   vscode/      VS Code user data + extensions    (code --user-data-dir ...)
+#   browsers/    one browser profile per browser   (brave, chrome, firefox, ...)
+#   gitconfig    git global config                 (GIT_CONFIG_GLOBAL)
+#   env          extra variables, KEY=VALUE per line
+#                ($NEST_VEIL_DIR, $HOME and ~ expand)
+#   dirs         directories that auto-enable the workspace (nest-veil set)
+#   parent       optional: name of the parent, overriding the directories
+# Login folders are created on first use, in the top-most workspace of the
+# chain, so nested workspaces share them by default.
+set -euo pipefail
+
+VERSION=0.1.0
+NEST_VEIL_HOME="${NEST_VEIL_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/nest-veil}"
+RESERVED=(new set unset off)
+LOGINS=(claude gh vscode)
+GIT_BEGIN="# >>> nest-veil: managed include, do not edit"
+GIT_END="# <<< nest-veil"
+SELF=$(basename "$0")
+
+# Wrappers for code, brave, firefox, ... that are put first on PATH inside a
+# workspace. Installed: /usr/lib/nest-veil/shims; from a checkout: ../shims.
+find_shims() {
+  local here
+  here=$(dirname "$(readlink -f "$0")")
+  if [[ -n ${NEST_VEIL_SHIMS-} ]]; then echo "$NEST_VEIL_SHIMS"
+  elif [[ -d $here/../lib/nest-veil/shims ]]; then realpath -m "$here/../lib/nest-veil/shims"
+  else realpath -m "$here/../shims"
+  fi
+}
+SHIMS=$(find_shims)
+
+die() { echo "$SELF: $*" >&2; exit 1; }
+tilde() { echo "${1/#$HOME/\~}"; }
+
+workspace_names() {
+  local d n
+  for d in "$NEST_VEIL_HOME"/*/; do
+    [[ -d $d ]] || continue
+    n=$(basename "$d")
+    [[ " ${RESERVED[*]} " == *" $n "* ]] || echo "$n"
+  done
+}
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && " ${RESERVED[*]} " != *" $1 "* ]]; }
+
+require_workspace() {
+  [[ -d $NEST_VEIL_HOME/$1 ]] && valid_name "$1" && return 0
+  echo "$SELF: no workspace named '$1'" >&2
+  echo "workspaces: $(workspace_names | tr '\n' ' ')" >&2
+  echo "create one with: $SELF new $1" >&2
+  exit 1
+}
+
+# One dirs-file line as an absolute path, or nothing for comments and blanks.
+normalize_dir() {
+  local d=$1
+  d="${d#"${d%%[![:space:]]*}"}"
+  d="${d%"${d##*[![:space:]]}"}"
+  [[ -z $d || $d == \#* ]] && return 0
+  d="${d/#\~/$HOME}"
+  [[ $d == / ]] || d="${d%/}"
+  echo "$d"
+}
+
+dirs_of() {
+  local f="$NEST_VEIL_HOME/$1/dirs" line
+  [[ -f $f ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do normalize_dir "$line"; done < "$f"
+}
+
+# A path given on the command line, made absolute without resolving symlinks
+# (so it matches the shell's $PWD).
+abs_path() {
+  local p=$1
+  [[ $p == /* ]] || p="$PWD/$p"
+  realpath -ms -- "$p"
+}
+
+# Prints "<workspace> <dir>" for the most specific dirs entry containing $1.
+# $2: workspace to skip. $3: "strict" to only match directories above $1.
+match_dir() {
+  local target=$1 skip=${2-} strict=${3-} best="" best_len=-1 name d
+  while IFS= read -r name; do
+    [[ $name == "$skip" ]] && continue
+    while IFS= read -r d; do
+      [[ -n $d ]] || continue
+      if [[ $target == "$d"/* || ($d == / && $target != /) || ($target == "$d" && -z $strict) ]] &&
+        (( ${#d} > best_len )); then
+        best="$name $d"
+        best_len=${#d}
+      fi
+    done < <(dirs_of "$name")
+  done < <(workspace_names)
+  [[ -n $best ]] && echo "$best"
+}
+
+# The workspace $1 is nested in: from its parent file, otherwise the
+# workspace whose directory contains $1's first directory.
+parent_of() {
+  local f="$NEST_VEIL_HOME/$1/parent" first m
+  if [[ -f $f ]]; then
+    grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$f" | head -n1 | tr -d '[:space:]' || true
+    return 0
+  fi
+  first=$(dirs_of "$1" | head -n1)
+  [[ -n $first ]] || return 0
+  m=$(match_dir "$first" "$1" strict) || true
+  echo "${m%% *}"
+}
+
+# Sets CHAIN to workspace $1 and its parents, nearest first.
+load_chain() {
+  local name=$1 seen=" "
+  CHAIN=()
+  while [[ -n $name ]]; do
+    [[ $seen == *" $name "* ]] && die "loop in workspace nesting: ${CHAIN[*]} $name"
+    valid_name "$name" && [[ -d $NEST_VEIL_HOME/$name ]] ||
+      die "workspace '${CHAIN[-1]-$1}' has parent '$name', which doesn't exist"
+    seen+="$name "
+    CHAIN+=("$name")
+    name=$(parent_of "$name")
+  done
+}
+
+# Path of ITEM in the nearest workspace of CHAIN that has it,
+# otherwise where the top-most workspace would keep it.
+nearest() {
+  local n
+  for n in "${CHAIN[@]}"; do
+    [[ -e $NEST_VEIL_HOME/$n/$1 ]] && { echo "$NEST_VEIL_HOME/$n/$1"; return; }
+  done
+  echo "$NEST_VEIL_HOME/${CHAIN[-1]}/$1"
+}
+
+# Make sure every gitconfig in CHAIN exists and starts by including the one
+# above it (the top one includes ~/.gitconfig), so settings stack.
+sync_gitconfigs() {
+  local i n f base block tmp
+  for ((i = ${#CHAIN[@]} - 1; i >= 0; i--)); do
+    n=${CHAIN[i]}
+    f="$NEST_VEIL_HOME/$n/gitconfig"
+    if (( i == ${#CHAIN[@]} - 1 )); then base="~/.gitconfig"
+    else base=$(tilde "$NEST_VEIL_HOME/${CHAIN[i + 1]}/gitconfig"); fi
+    block=$(printf '%s\n[include]\n\tpath = %s\n%s' "$GIT_BEGIN" "$base" "$GIT_END")
+    if [[ ! -f $f ]]; then
+      printf '# Git config for the %s workspace (used as GIT_CONFIG_GLOBAL).\n%s\n\n#[user]\n#\tname = Your Name\n#\temail = you@example.com\n' \
+        "$n" "$block" > "$f"
+    elif ! grep -qxF "$GIT_BEGIN" "$f"; then
+      tmp=$(mktemp "$f.XXXXXX")
+      { echo "$block"; echo; cat "$f"; } > "$tmp" && mv "$tmp" "$f"
+    elif [[ $(sed -n "/^$GIT_BEGIN\$/,/^$GIT_END\$/p" "$f") != "$block" ]]; then
+      tmp=$(mktemp "$f.XXXXXX")
+      awk -v b="$GIT_BEGIN" -v e="$GIT_END" -v blk="$block" '
+        $0 == b { print blk; skip = 1; next }
+        skip && $0 == e { skip = 0; next }
+        !skip' "$f" > "$tmp" && mv "$tmp" "$f"
+    fi
+  done
+}
+
+# KEY=VALUE lines of one workspace's env file.
+env_file_vars() {
+  local dir=$1 line key val
+  [[ -f $dir/env ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z $line || $line == \#* ]] && continue
+    line="${line#export }"
+    [[ $line == *=* ]] || { echo "$SELF: $dir/env: ignoring '$line'" >&2; continue; }
+    key="${line%%=*}"
+    val="${line#*=}"
+    [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "$SELF: $dir/env: bad name '$key'" >&2; continue; }
+    if [[ $val =~ ^\"(.*)\"$ || $val =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+    val="${val/#\~/$HOME}"
+    val="${val//\$\{NEST_VEIL_DIR\}/$dir}"
+    val="${val//\$NEST_VEIL_DIR/$dir}"
+    val="${val//\$\{HOME\}/$HOME}"
+    val="${val//\$HOME/$HOME}"
+    echo "$key=$val"
+  done < "$dir/env"
+}
+
+# All variables of workspace $1, as KEY=VALUE lines. Later lines win.
+profile_vars() {
+  local name=$1 i label=""
+  load_chain "$name"
+  sync_gitconfigs
+  for ((i = ${#CHAIN[@]} - 1; i >= 0; i--)); do label+="${label:+/}${CHAIN[i]}"; done
+  echo "NEST_VEIL=$name"
+  echo "NEST_VEIL_DIR=$NEST_VEIL_HOME/$name"
+  echo "NEST_VEIL_CHAIN=${CHAIN[*]}"
+  echo "NEST_VEIL_LABEL=$label"
+  echo "CLAUDE_CONFIG_DIR=$(nearest claude)"
+  echo "GH_CONFIG_DIR=$(nearest gh)"
+  echo "GIT_CONFIG_GLOBAL=$NEST_VEIL_HOME/$name/gitconfig"
+  for ((i = ${#CHAIN[@]} - 1; i >= 0; i--)); do env_file_vars "$NEST_VEIL_HOME/${CHAIN[i]}"; done
+}
+
+STATE_VARS="NEST_VEIL NEST_VEIL_DIR NEST_VEIL_CHAIN NEST_VEIL_LABEL NEST_VEIL_VARS NEST_VEIL_AUTO"
+
+path_without_shims() {
+  local IFS=: out=() p
+  for p in $PATH; do [[ $p == "$SHIMS" ]] || out+=("$p"); done
+  echo "${out[*]}"
+}
+
+# Drop whatever workspace this process is in.
+deactivate() {
+  local v
+  for v in ${NEST_VEIL_VARS-}; do unset "$v"; done
+  # shellcheck disable=SC2086
+  unset $STATE_VARS NEST_VEIL_OFF
+  PATH=$(path_without_shims)
+  export PATH
+}
+
+# Export workspace $1 into this process, so whatever we exec inherits it.
+activate() {
+  local vars line names=()
+  vars=$(profile_vars "$1")
+  deactivate
+  while IFS= read -r line; do
+    export "${line%%=*}=${line#*=}"
+    names+=("${line%%=*}")
+  done <<< "$vars"
+  export NEST_VEIL_VARS="${names[*]}"
+  export PATH="$SHIMS:$PATH"
+  load_chain "$1"
+}
+
+# The real binary for $1, skipping our own shims.
+real_cmd() {
+  PATH=$(path_without_shims) command -v "$1" || die "$1 not found"
+}
+
+# VS Code keeps settings, extensions and logins in --user-data-dir, so a
+# separate dir gives a fully separate instance.
+run_vscode() {
+  local real dir
+  real=$(real_cmd "$1")
+  shift
+  dir=$(nearest vscode)
+  exec "$real" \
+    --user-data-dir "$dir/data" \
+    --extensions-dir "$dir/extensions" \
+    "$@"
+}
+
+# Browsers get a separate profile dir per browser, which gives a separate
+# instance with its own logins, cookies and extensions next to the private one.
+run_browser() {
+  local cmd=$1 real dir
+  real=$(real_cmd "$cmd")
+  shift
+  dir=$(nearest "browsers/$(browser_name "$cmd")")
+  mkdir -p "$dir"
+  case $cmd in
+    # Firefox routes remote commands (opening a URL) to the instance running
+    # this profile, so later `nest-veil <name> firefox <url>` lands there.
+    firefox* | librewolf | zen-browser) exec "$real" --profile "$dir" "$@" ;;
+    *) exec "$real" --user-data-dir="$dir" "$@" ;;
+  esac
+}
+
+# Profile dir name, so e.g. google-chrome and google-chrome-stable share one.
+browser_name() {
+  case $1 in
+    brave*) echo brave ;;
+    google-chrome*) echo chrome ;;
+    microsoft-edge*) echo edge ;;
+    vivaldi*) echo vivaldi ;;
+    firefox*) echo firefox ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Run a command in the active workspace, using a handler where one exists.
+run_in_workspace() {
+  local cmd=$1
+  case $cmd in
+    code | code-oss | codium)
+      shift; run_vscode "$cmd" "$@" ;;
+    brave | brave-browser | brave-browser-stable | \
+    google-chrome | google-chrome-stable | chromium | \
+    microsoft-edge | microsoft-edge-stable | vivaldi | vivaldi-stable | opera | \
+    firefox | firefox-developer-edition | librewolf | zen-browser)
+      shift; run_browser "$cmd" "$@" ;;
+    *)
+      exec "$@" ;;
+  esac
+}
+
+fish_quote() {
+  local s=${1//\\/\\\\}
+  printf "'%s'" "${s//\'/\\\'}"
+}
+
+# Prints fish code that enters the workspace owning DIR when cd'ing into it,
+# switches when moving between workspaces' dirs, and leaves when cd'ing out,
+# but only if the hook was what turned it on. With "refresh", re-applies the
+# workspace even if it didn't change (after set/unset).
+hook_fish() {
+  local dir=$1 refresh=${2-} match target vars line names=()
+  [[ -n ${NEST_VEIL_OFF-} ]] && return 0
+  [[ -n ${NEST_VEIL-} && -z ${NEST_VEIL_AUTO-} ]] && return 0
+  match=$(match_dir "$dir") || true
+  target=${match%% *}
+  [[ -n $target && $target == "${NEST_VEIL-}" && -z $refresh ]] && return 0
+  [[ -n $target ]] && vars=$(profile_vars "$target")
+  if [[ -n ${NEST_VEIL-} ]]; then
+    echo "set -e ${NEST_VEIL_VARS-} $STATE_VARS"
+  fi
+  if [[ -n $target ]]; then
+    while IFS= read -r line; do
+      echo "set -gx ${line%%=*} $(fish_quote "${line#*=}")"
+      names+=("${line%%=*}")
+    done <<< "$vars"
+    echo "set -gx NEST_VEIL_VARS $(fish_quote "${names[*]}")"
+    echo "set -gx NEST_VEIL_AUTO $(fish_quote "${match#* }")"
+    echo "set -gx PATH $(fish_quote "$SHIMS") (string match -v -- $(fish_quote "$SHIMS") \$PATH)"
+  elif [[ -n ${NEST_VEIL-} ]]; then
+    echo "set -gx PATH (string match -v -- $(fish_quote "$SHIMS") \$PATH)"
+  fi
+}
+
+# Remove directory $2 from workspace $1's dirs file; true if it was there.
+remove_dir() {
+  local f="$NEST_VEIL_HOME/$1/dirs" line found=1 tmp
+  [[ -f $f ]] || return 1
+  tmp=$(mktemp "$f.XXXXXX")
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $(normalize_dir "$line") == "$2" ]]; then found=0; else printf '%s\n' "$line"; fi
+  done < "$f" > "$tmp"
+  mv "$tmp" "$f"
+  return $found
+}
+
+set_dir() {
+  local name=${1-} dir other f parent
+  [[ -n $name && -n ${2-} && -z ${3-} ]] || die "usage: $SELF set <name> <dir>"
+  require_workspace "$name"
+  dir=$(abs_path "$2")
+  [[ -d $dir ]] || echo "$SELF: note: $(tilde "$dir") doesn't exist (yet)" >&2
+  if dirs_of "$name" | grep -qxF -- "$dir"; then
+    echo "$(tilde "$dir") already belongs to $name"
+    return 0
+  fi
+  while IFS= read -r other; do
+    [[ $other == "$name" ]] && continue
+    remove_dir "$other" "$dir" && echo "moved $(tilde "$dir") from $other"
+  done < <(workspace_names)
+  f="$NEST_VEIL_HOME/$name/dirs"
+  [[ -f $f ]] || echo "# Directories that auto-enable this workspace; managed by nest-veil set/unset." > "$f"
+  tilde "$dir" >> "$f"
+  parent=$(parent_of "$name")
+  echo "$(tilde "$dir") -> $name${parent:+ (nested in $parent)}"
+}
+
+unset_dir() {
+  local dir name found=""
+  [[ -n ${1-} && -z ${2-} ]] || die "usage: $SELF unset <dir>"
+  dir=$(abs_path "$1")
+  while IFS= read -r name; do
+    remove_dir "$name" "$dir" && found+=" $name"
+  done < <(workspace_names)
+  [[ -n $found ]] || die "no workspace is set for $(tilde "$dir")"
+  echo "$(tilde "$dir") no longer auto-enables$found"
+}
+
+# Login folders workspace $1 takes from a parent, as "item<-owner".
+inherited() {
+  local name=$1 item path owner out=() b n items
+  load_chain "$name"
+  (( ${#CHAIN[@]} > 1 )) || return 0
+  items=("${LOGINS[@]}")
+  for n in "${CHAIN[@]}"; do
+    for b in "$NEST_VEIL_HOME/$n"/browsers/*/; do
+      [[ -d $b ]] && items+=("browsers/$(basename "$b")")
+    done
+  done
+  for item in $(printf '%s\n' "${items[@]}" | awk '!seen[$0]++'); do
+    path=$(nearest "$item")
+    [[ -e $path ]] || continue
+    owner=${path#"$NEST_VEIL_HOME"/}
+    owner=${owner%%/*}
+    [[ $owner == "$name" ]] || out+=("$item<-$owner")
+  done
+  echo "${out[*]}"
+}
+
+declare -A PARENT
+print_tree() {
+  local parent=$1 indent=$2 name dirs shared
+  for name in $(workspace_names); do
+    [[ ${PARENT[$name]} == "$parent" ]] || continue
+    dirs=$(dirs_of "$name" | while IFS= read -r d; do tilde "$d"; done | paste -sd ' ' || true)
+    printf '  %-16s %s\n' "$indent$name" "${dirs:-(no directories; $SELF set $name <dir>)}"
+    if [[ -n $parent ]]; then
+      shared=$(inherited "$name" 2>/dev/null) || shared="(broken nesting)"
+      [[ -n $shared ]] && printf '  %-16s shares: %s\n' "" "$shared"
+    fi
+    print_tree "$name" "$indent  "
+  done
+}
+
+show_status() {
+  local name p
+  if [[ -n ${NEST_VEIL-} ]]; then
+    echo "active: ${NEST_VEIL_LABEL:-$NEST_VEIL}${NEST_VEIL_AUTO:+ (auto, from $(tilde "$NEST_VEIL_AUTO"))}"
+  elif [[ -n ${NEST_VEIL_OFF-} ]]; then
+    echo "active: none ($SELF off)"
+  else
+    echo "active: none"
+  fi
+  echo
+  if [[ -z $(workspace_names) ]]; then
+    echo "no workspaces yet; create one with: $SELF new <name>"
+    return 0
+  fi
+  echo "workspaces in $(tilde "$NEST_VEIL_HOME"):"
+  for name in $(workspace_names); do
+    p=$(parent_of "$name")
+    [[ -n $p && -d $NEST_VEIL_HOME/$p ]] || p=""
+    PARENT[$name]=$p
+  done
+  print_tree "" ""
+}
+
+new_workspace() {
+  local name=${1-} dir
+  [[ -n $name && -z ${2-} ]] || die "usage: $SELF new <name>"
+  valid_name "$name" || die "'$name' is not a valid workspace name"
+  dir="$NEST_VEIL_HOME/$name"
+  [[ -e $dir ]] && die "workspace '$name' already exists in $(tilde "$dir")"
+  mkdir -p "$dir"
+  cat > "$dir/env" <<EOF
+# Extra variables for the $name workspace, KEY=VALUE per line, applied on top
+# of the parent workspace's. \$NEST_VEIL_DIR (this folder), \$HOME and ~ expand.
+#NEST_VEIL_COLOR=cyan                            # prompt marker colour
+#AWS_PROFILE=$name
+#KUBECONFIG=\$NEST_VEIL_DIR/kube/config
+#DOCKER_CONFIG=\$NEST_VEIL_DIR/docker
+#AZURE_CONFIG_DIR=\$NEST_VEIL_DIR/azure
+#CLOUDSDK_CONFIG=\$NEST_VEIL_DIR/gcloud
+#NPM_CONFIG_USERCONFIG=\$NEST_VEIL_DIR/npmrc
+#GIT_SSH_COMMAND=ssh -i ~/.ssh/id_$name -o IdentitiesOnly=yes
+EOF
+  echo "created workspace $name in $(tilde "$dir")"
+  echo "next: $SELF set $name <dir>"
+}
+
+case "${1-}" in
+  "" | --status | status)
+    show_status
+    ;;
+  -h | --help)
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
+    ;;
+  -V | --version)
+    echo "nest-veil $VERSION"
+    ;;
+  --names)
+    workspace_names
+    ;;
+  --hook)
+    [[ ${2-} == fish ]] || die "only fish hooks are supported"
+    hook_fish "${3:-$PWD}" "${4-}"
+    ;;
+  new)
+    shift
+    new_workspace "$@"
+    ;;
+  set)
+    shift
+    set_dir "$@"
+    ;;
+  unset)
+    shift
+    unset_dir "$@"
+    ;;
+  off)
+    shift
+    deactivate
+    export NEST_VEIL_OFF=1
+    if (( $# )); then exec "$@"; else exec "${SHELL:-/bin/bash}"; fi
+    ;;
+  -*)
+    die "unknown option $1 (see $SELF --help)"
+    ;;
+  *)
+    name=$1
+    shift
+    require_workspace "$name"
+    activate "$name"
+    if (( $# )); then run_in_workspace "$@"; else exec "${SHELL:-/bin/bash}"; fi
+    ;;
+esac

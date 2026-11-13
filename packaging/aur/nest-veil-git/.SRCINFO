@@ -1,0 +1,21 @@
+pkgbase = nest-veil-git
+	pkgdesc = Separate logins and configs per client or project, switched by directory, with nesting
+	pkgver = 0.1.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/Exouxas/nest-veil
+	arch = any
+	license = MIT
+	checkdepends = git
+	makedepends = git
+	depends = bash
+	depends = coreutils
+	depends = gawk
+	depends = grep
+	depends = sed
+	optdepends = fish: switching workspaces by directory, prompt marker and completions
+	provides = nest-veil
+	conflicts = nest-veil
+	source = git+https://github.com/Exouxas/nest-veil.git
+	sha256sums = SKIP
+
+pkgname = nest-veil-git

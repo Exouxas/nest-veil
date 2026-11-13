@@ -1,0 +1,45 @@
+# Maintainer: Christoffer Aske <christoffer.aske@gmail.com>
+
+pkgname=nest-veil-git
+_pkgname=nest-veil
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='Separate logins and configs per client or project, switched by directory, with nesting'
+arch=('any')
+url='https://github.com/Exouxas/nest-veil'
+license=('MIT')
+depends=('bash' 'coreutils' 'gawk' 'grep' 'sed')
+makedepends=('git')
+checkdepends=('git')
+optdepends=(
+  'fish: switching workspaces by directory, prompt marker and completions'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf '%s.r%s.g%s' \
+    "$(sed -n 's/^VERSION=//p' bin/nest-veil | head -n1)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+check() {
+  cd "$_pkgname"
+  tests/run.sh
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm0755 -t "$pkgdir/usr/bin/" bin/nest-veil
+  install -dm0755 "$pkgdir/usr/lib/$_pkgname/shims"
+  cp -P shims/* "$pkgdir/usr/lib/$_pkgname/shims/"
+  chmod 0755 "$pkgdir/usr/lib/$_pkgname/shims/code"
+  install -Dm0644 -t "$pkgdir/usr/share/fish/vendor_conf.d/" fish/conf.d/nest-veil.fish
+  install -Dm0644 -t "$pkgdir/usr/share/fish/vendor_completions.d/" fish/completions/nest-veil.fish
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md
+}
